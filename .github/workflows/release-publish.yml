@@ -1,0 +1,177 @@
+name: Release Publish
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.100"
+
+      - name: Assert annotated release tag
+        if: github.event_name == 'push'
+        run: |
+          git fetch --force --tags origin
+          TAG_TYPE="$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(objecttype)')"
+          test "${TAG_TYPE}" = "tag"
+
+      - name: Validate release versions
+        run: |
+          python3 - <<'PY'
+          versions = ['0.1.0']
+          if not versions:
+              raise SystemExit("No publishable .NET projects are configured for release publishing.")
+          unique_versions = sorted(set(versions))
+          if len(unique_versions) != 1:
+              raise SystemExit(f"Release publishing expects one version across projects, got: {unique_versions}")
+          version = unique_versions[0]
+          if version.endswith("+dev-SNAPSHOT"):
+              raise SystemExit(f"NuGet release publishing requires a non-snapshot version, got {version}")
+          print(version)
+          PY
+
+      - name: Match tag to published version
+        if: github.event_name == 'push'
+        run: |
+          EXPECTED_VERSION="${GITHUB_REF_NAME#v}"
+          ACTUAL_VERSION="$(python3 - <<'PY'
+          versions = ['0.1.0']
+          unique_versions = sorted(set(versions))
+          print(unique_versions[0])
+          PY
+          )"
+          test "${ACTUAL_VERSION}" = "${EXPECTED_VERSION}"
+
+      - name: Pack release artifacts
+        run: |
+
+          dotnet pack "src/Wabbit.Codec.NBT/Wabbit.Codec.NBT.fsproj" -c Release --nologo --output "artifacts/packages/fsharp-codec-nbt-src-Wabbit.Codec.NBT"
+
+
+      - name: Publish packages to NuGet
+        if: github.event_name == 'push'
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          test -n "${NUGET_API_KEY}"
+
+          find "artifacts/packages/fsharp-codec-nbt-src-Wabbit.Codec.NBT" -maxdepth 1 -type f -name '*.nupkg' ! -name '*.symbols.nupkg' -print0 | while IFS= read -r -d '' package; do
+            dotnet nuget push "$package" --api-key "${NUGET_API_KEY}" --source "https://api.nuget.org/v3/index.json" --skip-duplicate
+          done
+
+
+      - name: Bundle GitHub Release assets
+        if: github.event_name == 'push'
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import zipfile
+          from pathlib import Path
+
+          output_dir = Path("build/releases")
+          output_dir.mkdir(parents=True, exist_ok=True)
+
+          repo_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
+          version_label = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          projects = json.loads(r'''[{"projectId": "fsharp-codec-nbt/src/Wabbit.Codec.NBT", "assetSlug": "fsharp-codec-nbt-src-Wabbit.Codec.NBT", "sourceDir": "/Users/wabbit/ws/datatron/fsharp-codec-nbt/artifacts/packages/fsharp-codec-nbt-src-Wabbit.Codec.NBT", "archivePrefix": "packages", "bundleKind": "dotnet-nuget"}]''')
+
+          assets = []
+          bundle_paths = []
+          for project in projects:
+              source_dir = Path(project["sourceDir"])
+              if not source_dir.is_dir():
+                  raise SystemExit(f"Missing release bundle source directory: {source_dir}")
+
+              files = sorted(path for path in source_dir.rglob("*") if path.is_file())
+              if not files:
+                  raise SystemExit(f"No release bundle inputs found under {source_dir}")
+
+              bundle_name = f"{repo_name}-{version_label}-{project['assetSlug']}.zip"
+              bundle_path = output_dir / bundle_name
+              with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                  for path in files:
+                      archive.write(path, Path(project["archivePrefix"]) / path.relative_to(source_dir))
+
+              digest = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+              assets.append(
+                  {
+                      "projectId": project["projectId"],
+                      "bundleKind": project["bundleKind"],
+                      "fileName": bundle_path.name,
+                      "path": str(bundle_path.resolve()),
+                      "sha256": digest,
+                      "sizeBytes": bundle_path.stat().st_size,
+                  }
+              )
+              bundle_paths.append(bundle_path)
+
+          aggregate_path = output_dir / f"{repo_name}-{version_label}-all.zip"
+          with zipfile.ZipFile(aggregate_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for path in bundle_paths:
+                  archive.write(path, path.name)
+
+          aggregate_digest = hashlib.sha256(aggregate_path.read_bytes()).hexdigest()
+          assets.append(
+              {
+                  "kind": "aggregate",
+                  "fileName": aggregate_path.name,
+                  "path": str(aggregate_path.resolve()),
+                  "sha256": aggregate_digest,
+                  "sizeBytes": aggregate_path.stat().st_size,
+              }
+          )
+
+          checksums_path = output_dir / "SHA256SUMS"
+          checksum_lines = [
+              f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
+              for path in sorted([*bundle_paths, aggregate_path])
+          ]
+          checksums_path.write_text("\\n".join(checksum_lines) + "\\n", encoding="utf-8")
+
+          manifest_path = output_dir / "release-manifest.json"
+          manifest_path.write_text(
+              json.dumps(
+                  {
+                      "repo": {
+                          "name": repo_name,
+                          "githubRepo": os.environ["GITHUB_REPOSITORY"],
+                          "versionLabel": version_label,
+                      },
+                      "assets": assets,
+                  },
+                  indent=2,
+              )
+              + "\\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Publish GitHub Release assets
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            build/releases/*.zip
+            build/releases/release-manifest.json
+            build/releases/SHA256SUMS
