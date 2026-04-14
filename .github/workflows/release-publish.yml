@@ -93,7 +93,7 @@ jobs:
 
           repo_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
           version_label = os.environ["GITHUB_REF_NAME"].removeprefix("v")
-          projects = json.loads(r'''[{"projectId": "fsharp-codec-nbt/src/Wabbit.Codec.NBT", "assetSlug": "fsharp-codec-nbt-src-Wabbit.Codec.NBT", "sourceDir": "/Users/wabbit/ws/datatron/fsharp-codec-nbt/artifacts/packages/fsharp-codec-nbt-src-Wabbit.Codec.NBT", "archivePrefix": "packages", "bundleKind": "dotnet-nuget"}]''')
+          projects = json.loads(r'''[{"projectId": "fsharp-codec-nbt/src/Wabbit.Codec.NBT", "assetSlug": "fsharp-codec-nbt-src-Wabbit.Codec.NBT", "sourceDir": "artifacts/packages/fsharp-codec-nbt-src-Wabbit.Codec.NBT", "archivePrefix": "packages", "bundleKind": "dotnet-nuget"}]''')
 
           assets = []
           bundle_paths = []
